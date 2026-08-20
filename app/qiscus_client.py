@@ -117,7 +117,11 @@ class QiscusClient:
             resp.raise_for_status()
             return True
         except requests.RequestException:
-            logger.exception("Failed to assign agent %s to room %s", agent_id, room_id)
+            body = resp.text if "resp" in locals() else "<no response>"
+            logger.error(
+                "Failed to assign agent %s to room %s - response body: %s",
+                agent_id, room_id, body, exc_info=True,
+            )
             return False
 
     def mark_as_resolved(

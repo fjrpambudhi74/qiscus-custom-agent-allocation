@@ -104,14 +104,21 @@ def handle_resolved(session: Session, payload: ResolvedWebhookPayload) -> None:
 
 
 def process_queue(session: Session) -> None:
-    """Drain the FIFO queue, oldest first, strictly in order.
+    """Drain the FIFO queue, oldest first.
 
     Checks the local queue table *before* ever calling the API - if it's
     empty (the common case), this is a pure local read with zero API calls.
     Only once we know there's someone waiting do we spend an API call
-    checking if their specific room now has a free agent. If the oldest
-    entry still can't be served, we stop rather than skipping ahead - keeps
-    FIFO ordering strict.
+    checking if their specific room now has a free agent.
+
+    If the oldest entry has no candidate agent yet (everyone's still full),
+    we stop rather than skipping ahead - that's likely transient and keeps
+    FIFO ordering strict. But if the Assign Agent call itself fails (a real
+    API error, not just "nobody free"), retrying the same request forever
+    would both spam identical errors and permanently block every customer
+    queued behind it - a single bad room_id must not stall the whole
+    queue - so that entry is marked `failed` and we move on to the next one
+    instead of stopping.
     """
     while True:
         entry = session.exec(
@@ -128,8 +135,15 @@ def process_queue(session: Session) -> None:
 
         assigned = assign_customer_to_agent(session, candidate["id"], entry.room_id, entry.customer_id)
         if not assigned:
-            # avoid a tight retry loop against a broken API call
-            break
+            logger.warning(
+                "Giving up on queue entry id=%s room=%s after a failed assign call - "
+                "marking failed instead of retrying forever",
+                entry.id, entry.room_id,
+            )
+            entry.status = QueueStatus.failed
+            session.add(entry)
+            session.commit()
+            continue
 
         entry.status = QueueStatus.assigned
         session.add(entry)

@@ -13,6 +13,7 @@ class AssignmentStatus(str, Enum):
 class QueueStatus(str, Enum):
     waiting = "waiting"
     assigned = "assigned"
+    failed = "failed"
 
 
 class Assignment(SQLModel, table=True):
