@@ -203,6 +203,46 @@ Not yet explicitly tested (lower priority, logic is shared with what's
 already proven above so risk is low): explicit restart-survival check for
 SQLite/volume persistence across a redeploy.
 
+## Phase 4.5 — Bugs found from real production logs, fixed (2026-08-20)
+
+Two correctness bugs surfaced after the Phase 4 verification, both from
+actual Railway logs rather than testing in advance - worth a reviewer
+knowing these were caught and fixed post-launch, not just designed away:
+
+1. **A failed queue entry blocked the entire queue behind it.**
+   `process_queue()` used to `break` the whole drain loop on any failed
+   Assign Agent call, leaving that entry `waiting` forever and starving
+   every customer queued behind it. Confirmed in production: the same
+   room/agent pair (`room=469027331`, `agent=192563`) failed identically,
+   ~19 hours apart, meaning it had been silently retrying and failing on
+   every 30s scheduler tick the whole time. Fix: added a `failed`
+   `QueueStatus` - a failed entry is marked `failed` and the loop moves on
+   to the next entry instead of stopping. Also improved
+   `qiscus_client.assign_agent()` to log the actual response body on
+   failure (previously only the status code), for better diagnosis next
+   time.
+2. **Race condition could push an agent over its capacity cap.** Two
+   webhooks for different rooms arriving close together could both call
+   `Available Agents (v2)` and read the same agent's
+   `current_customer_count` *before* either assignment committed - both
+   see it as under-capacity, both get assigned, capacity cap overshot.
+   `Assign Agent`'s `max_agent` param only guards against double-assigning
+   a single *room*, not an agent's total load, so it didn't help here.
+   Fix: wrapped the check-then-assign critical section in both
+   `handle_new_session()` and `process_queue()` with a `threading.Lock` -
+   correct primitive since FastAPI's sync handlers and APScheduler's job
+   both run on threads in this single-replica deployment. Verified with a
+   10-concurrent-thread test against a capacity-2 agent: confirmed
+   over-assignment to 10/2 with the lock removed, correctly capped at 2/2
+   with it restored. This was a real concern going into submission since
+   the reviewer may load-test with many simultaneous chats specifically to
+   check for this.
+
+Known remaining limitation: the lock only protects this single Railway
+replica. If this were ever horizontally scaled (multiple replicas), a
+distributed lock (e.g. Redis-based) would be needed instead - out of scope
+for this test but worth naming if asked.
+
 ## Phase 5 — Submission
 
 - [ ] Push repo to GitHub (public or invite the reviewer)
