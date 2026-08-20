@@ -243,6 +243,56 @@ replica. If this were ever horizontally scaled (multiple replicas), a
 distributed lock (e.g. Redis-based) would be needed instead - out of scope
 for this test but worth naming if asked.
 
+## Phase 4.6 — Reviewer's real automated load test broke the cap anyway (2026-08-20)
+
+The reviewer ran an automated test (~10 concurrent chats) *after* Phase 4.5's
+lock fix was live. Result: agent A ended up with 4 active rooms, agent B
+with 6, against a cap of 2 each - the lock alone wasn't enough. Full
+Railway logs for the test window were captured and traced line by line.
+Two distinct root causes, both confirmed from the log evidence (not
+guessed):
+
+1. **`current_customer_count` lags behind Qiscus's own writes under load.**
+   The log timestamps prove `_allocation_lock` *was* working - our own
+   assign calls happened one at a time, ~1-1.5s apart, never concurrently.
+   But even processed strictly sequentially: room 276 → agent 192563
+   (count should be 1), room 278 → agent 192563 (count should be 2, at
+   cap), then room 277 → agent 192563 *again* succeeded a second later -
+   Qiscus's `current_customer_count` for 192563 still read as under-cap
+   when we checked it for room 277, because it hadn't caught up to the
+   room-278 assignment we'd just made. A client-side lock can't fix a
+   server-side counter that's slow to update. Fix: capacity is now
+   `max(qiscus_count, local_active_count)` - the local count (from our own
+   `Assignment` table) is written synchronously inside the same lock, so
+   it has zero lag and acts as an authoritative floor.
+2. **Qiscus redelivers the allocation webhook for the same room under
+   load.** Every single room in the test's log window received the
+   `Allocation webhook received for room=...` line *twice*, milliseconds
+   to ~1s apart (likely a timeout-triggered retry on Qiscus's end since
+   responses were slower under concurrent load). Without a check, the
+   redelivery re-runs the whole assignment decision independently -
+   sometimes safely rejected by Qiscus's own room-level `max_agent` guard
+   (visible in the logs as `"Cant join room, exceed max agents"` 400s),
+   but not always, and it also caused already-served rooms to get
+   redundantly enqueued (`Queued room=... (no agent available)` for a
+   room that had already been successfully assigned earlier in the same
+   log). Fix: an idempotency check - if `room_id` already has an active
+   `Assignment`, ignore the (re-)delivery - added to both
+   `handle_new_session()` and `process_queue()`.
+
+Verified with 2 new tests before redeploying: (a) `current_customer_count`
+pinned at 0 forever (worst-case permanent lag) across 5 sequential
+requests for one agent still caps at exactly 2/2; (b) the same room's
+allocation webhook delivered 3x results in exactly 1 real `assign_agent`
+call and 1 `Assignment` row, not 3.
+
+Takeaway worth remembering: a fix that's *proven* to close a race with a
+synthetic concurrency test can still be insufficient against a real
+external system's own consistency guarantees (or lack thereof) and
+delivery semantics (at-least-once, not exactly-once). Both needed real
+production log evidence to catch - neither was reproducible from our local
+mocked tests, which controlled both of those variables away by construction.
+
 ## Phase 5 — Submission
 
 - [ ] Push repo to GitHub (public or invite the reviewer)
