@@ -15,11 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Serializes the "check current_customer_count, then decide, then call Assign
 # Agent" critical section across every concurrent webhook/scheduler thread in
-# this process. Without it, two chats arriving at nearly the same instant can
-# both read the same agent's count *before* either assignment is written,
-# both see it as under-capacity, and both get assigned - overshooting the
-# configured cap (Assign Agent's `max_agent` guard only protects against a
-# room getting double-assigned, it says nothing about an agent's own load).
+# this process. Necessary but NOT sufficient on its own - see
+# get_available_agent_for_room()'s local-count fallback below for why.
 # A plain threading.Lock is correct here because FastAPI runs these sync
 # route handlers in a thread pool, and APScheduler's jobs run on their own
 # thread too - all real concurrency in this single-replica deployment is
@@ -27,15 +24,33 @@ logger = logging.getLogger(__name__)
 _allocation_lock = threading.Lock()
 
 
-def get_available_agent_for_room(room_id: str) -> Optional[dict[str, Any]]:
-    """Ask Qiscus (live) who's eligible for this room, then apply our own
-    configurable max-capacity rule on top of Qiscus's own
-    `current_customer_count` - least-busy-under-cap wins.
+def _local_active_count(session: Session, qiscus_agent_id: str) -> int:
+    rows = session.exec(
+        select(Assignment).where(
+            Assignment.qiscus_agent_id == str(qiscus_agent_id),
+            Assignment.status == AssignmentStatus.active,
+        )
+    ).all()
+    return len(rows)
 
-    No local session needed: this doesn't touch our DB, it's a live read
-    from Available Agents (v2), which is why we don't need to track
-    per-agent online status/capacity locally anymore (see qiscus_client.py
-    for why this endpoint was chosen over Get All Agents).
+
+def get_available_agent_for_room(session: Session, room_id: str) -> Optional[dict[str, Any]]:
+    """Ask Qiscus (live) who's eligible for this room, then apply our own
+    configurable max-capacity rule - least-busy-under-cap wins.
+
+    Capacity is the *max* of Qiscus's own `current_customer_count` and our
+    own locally-committed active-assignment count for that agent, not
+    Qiscus's number alone. Confirmed in production under load
+    (2026-08-20): even with `_allocation_lock` correctly serializing our
+    own requests (assignments happened one at a time, not concurrently),
+    a room could still get assigned to an agent already at its cap,
+    because `current_customer_count` hadn't caught up yet to an
+    assignment we'd made moments earlier - Qiscus's own count lags behind
+    its writes under load. Our local count is written synchronously
+    inside this same lock, so it never has that lag - it's the
+    authoritative floor, with Qiscus's count only able to push a
+    candidate's effective count *up* (e.g. a manual dashboard assignment
+    we don't know about locally), never down.
     """
     agents = get_qiscus_client().available_agents(room_id)
     candidates = []
@@ -44,7 +59,8 @@ def get_available_agent_for_room(room_id: str) -> Optional[dict[str, Any]]:
         if agent_id is None:
             continue
         is_available = raw.get("is_available", True)
-        count = raw.get("current_customer_count", 0)
+        qiscus_count = raw.get("current_customer_count", 0)
+        count = max(qiscus_count, _local_active_count(session, agent_id))
         if is_available and count < settings.default_max_capacity:
             candidates.append((raw, count))
     if not candidates:
@@ -86,13 +102,34 @@ def enqueue_customer(session: Session, room_id: str, customer_id: Optional[str],
     logger.info("Queued room=%s (no agent available)", room_id)
 
 
+def _existing_active_assignment(session: Session, room_id: str) -> Optional[Assignment]:
+    return session.exec(
+        select(Assignment).where(
+            Assignment.room_id == room_id,
+            Assignment.status == AssignmentStatus.active,
+        )
+    ).first()
+
+
 def handle_new_session(session: Session, payload: AllocationWebhookPayload) -> None:
     # Qiscus doesn't send a distinct customer id field here - email is the
     # closest stable identifier in the real payload shape.
     customer_id = payload.email
 
     with _allocation_lock:
-        candidate = get_available_agent_for_room(payload.room_id)
+        # Qiscus redelivers the allocation webhook for the same room under
+        # load (confirmed in production, 2026-08-20 - every room in a
+        # concurrent test got the webhook twice). Without this check a
+        # redelivery re-runs the whole decision and can double-assign.
+        existing = _existing_active_assignment(session, payload.room_id)
+        if existing:
+            logger.info(
+                "Ignoring duplicate allocation webhook for room=%s (already assigned to agent=%s)",
+                payload.room_id, existing.qiscus_agent_id,
+            )
+            return
+
+        candidate = get_available_agent_for_room(session, payload.room_id)
         if candidate:
             assign_customer_to_agent(session, candidate["id"], payload.room_id, customer_id)
         else:
@@ -145,7 +182,22 @@ def process_queue(session: Session) -> None:
             break
 
         with _allocation_lock:
-            candidate = get_available_agent_for_room(entry.room_id)
+            # Same duplicate-webhook scenario as handle_new_session can
+            # land a room in the queue that's already been served by
+            # another (non-duplicate) delivery - discard rather than
+            # trying to assign it a second time.
+            existing = _existing_active_assignment(session, entry.room_id)
+            if existing:
+                logger.info(
+                    "Queue entry id=%s room=%s already assigned to agent=%s - discarding duplicate",
+                    entry.id, entry.room_id, existing.qiscus_agent_id,
+                )
+                entry.status = QueueStatus.assigned
+                session.add(entry)
+                session.commit()
+                continue
+
+            candidate = get_available_agent_for_room(session, entry.room_id)
             if not candidate:
                 break
 
