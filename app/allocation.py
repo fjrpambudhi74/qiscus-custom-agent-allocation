@@ -111,6 +111,15 @@ def _existing_active_assignment(session: Session, room_id: str) -> Optional[Assi
     ).first()
 
 
+def _existing_waiting_queue_entry(session: Session, room_id: str) -> Optional[QueueEntry]:
+    return session.exec(
+        select(QueueEntry).where(
+            QueueEntry.room_id == room_id,
+            QueueEntry.status == QueueStatus.waiting,
+        )
+    ).first()
+
+
 def handle_new_session(session: Session, payload: AllocationWebhookPayload) -> None:
     # Qiscus doesn't send a distinct customer id field here - email is the
     # closest stable identifier in the real payload shape.
@@ -132,6 +141,24 @@ def handle_new_session(session: Session, payload: AllocationWebhookPayload) -> N
         candidate = get_available_agent_for_room(session, payload.room_id)
         if candidate:
             assign_customer_to_agent(session, candidate["id"], payload.room_id, customer_id)
+        elif _existing_waiting_queue_entry(session, payload.room_id):
+            # Same redelivery scenario, but caught here instead: the first
+            # delivery already queued this room (nobody was free yet).
+            # Without this check, a redelivered webhook creates a *second*
+            # queue entry for the same room - observed in production
+            # (2026-08-20): the leftover duplicate entry survived long
+            # enough that by the time the scheduler got to it, the room had
+            # already been served *and resolved* through the original
+            # entry, so `_existing_active_assignment` above no longer
+            # caught it (status had moved past "active"), and Assign Agent
+            # correctly rejected it ("room already resolved") - harmless
+            # (auto-marked `failed` by process_queue), but a wasted API
+            # call and a confusing error log for something that was never
+            # a real customer needing service.
+            logger.info(
+                "Room=%s is already queued (duplicate allocation webhook) - not adding a second entry",
+                payload.room_id,
+            )
         else:
             enqueue_customer(session, payload.room_id, customer_id, payload.model_dump())
 
