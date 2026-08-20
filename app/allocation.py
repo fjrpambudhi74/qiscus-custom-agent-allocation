@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -11,6 +12,19 @@ from app.qiscus_client import get_qiscus_client
 from app.schemas import AllocationWebhookPayload, ResolvedWebhookPayload
 
 logger = logging.getLogger(__name__)
+
+# Serializes the "check current_customer_count, then decide, then call Assign
+# Agent" critical section across every concurrent webhook/scheduler thread in
+# this process. Without it, two chats arriving at nearly the same instant can
+# both read the same agent's count *before* either assignment is written,
+# both see it as under-capacity, and both get assigned - overshooting the
+# configured cap (Assign Agent's `max_agent` guard only protects against a
+# room getting double-assigned, it says nothing about an agent's own load).
+# A plain threading.Lock is correct here because FastAPI runs these sync
+# route handlers in a thread pool, and APScheduler's jobs run on their own
+# thread too - all real concurrency in this single-replica deployment is
+# thread-based, not multi-process.
+_allocation_lock = threading.Lock()
 
 
 def get_available_agent_for_room(room_id: str) -> Optional[dict[str, Any]]:
@@ -77,11 +91,12 @@ def handle_new_session(session: Session, payload: AllocationWebhookPayload) -> N
     # closest stable identifier in the real payload shape.
     customer_id = payload.email
 
-    candidate = get_available_agent_for_room(payload.room_id)
-    if candidate:
-        assign_customer_to_agent(session, candidate["id"], payload.room_id, customer_id)
-    else:
-        enqueue_customer(session, payload.room_id, customer_id, payload.model_dump())
+    with _allocation_lock:
+        candidate = get_available_agent_for_room(payload.room_id)
+        if candidate:
+            assign_customer_to_agent(session, candidate["id"], payload.room_id, customer_id)
+        else:
+            enqueue_customer(session, payload.room_id, customer_id, payload.model_dump())
 
 
 def handle_resolved(session: Session, payload: ResolvedWebhookPayload) -> None:
@@ -129,22 +144,23 @@ def process_queue(session: Session) -> None:
         if not entry:
             break
 
-        candidate = get_available_agent_for_room(entry.room_id)
-        if not candidate:
-            break
+        with _allocation_lock:
+            candidate = get_available_agent_for_room(entry.room_id)
+            if not candidate:
+                break
 
-        assigned = assign_customer_to_agent(session, candidate["id"], entry.room_id, entry.customer_id)
-        if not assigned:
-            logger.warning(
-                "Giving up on queue entry id=%s room=%s after a failed assign call - "
-                "marking failed instead of retrying forever",
-                entry.id, entry.room_id,
-            )
-            entry.status = QueueStatus.failed
+            assigned = assign_customer_to_agent(session, candidate["id"], entry.room_id, entry.customer_id)
+            if not assigned:
+                logger.warning(
+                    "Giving up on queue entry id=%s room=%s after a failed assign call - "
+                    "marking failed instead of retrying forever",
+                    entry.id, entry.room_id,
+                )
+                entry.status = QueueStatus.failed
+                session.add(entry)
+                session.commit()
+                continue
+
+            entry.status = QueueStatus.assigned
             session.add(entry)
             session.commit()
-            continue
-
-        entry.status = QueueStatus.assigned
-        session.add(entry)
-        session.commit()
