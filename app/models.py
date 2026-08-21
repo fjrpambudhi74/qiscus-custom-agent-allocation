@@ -38,3 +38,4 @@ class QueueEntry(SQLModel, table=True):
     raw_payload: Optional[str] = None
     status: QueueStatus = QueueStatus.waiting
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    attempts: int = Field(default=0)

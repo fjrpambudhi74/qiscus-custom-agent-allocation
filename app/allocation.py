@@ -13,6 +13,16 @@ from app.schemas import AllocationWebhookPayload, ResolvedWebhookPayload
 
 logger = logging.getLogger(__name__)
 
+# How many times to retry a queue entry whose Assign Agent call itself
+# fails before giving up on it. Confirmed in production (2026-08-20): a
+# fresh, never-before-assigned room can still get "Cant join room, exceed
+# max agents" from Qiscus's own Assign Agent endpoint - a same shape of
+# eventual-consistency lag as get_available_agent_for_room()'s fallback
+# below, but this time on Qiscus's write path rather than its read path,
+# so it can't be fixed by our own local-count check. Retrying on a later
+# poll (rather than immediately) gives that lag time to settle.
+MAX_ASSIGN_ATTEMPTS = 3
+
 # Serializes the "check current_customer_count, then decide, then call Assign
 # Agent" critical section across every concurrent webhook/scheduler thread in
 # this process. Necessary but NOT sufficient on its own - see
@@ -192,23 +202,37 @@ def process_queue(session: Session) -> None:
 
     If the oldest entry has no candidate agent yet (everyone's still full),
     we stop rather than skipping ahead - that's likely transient and keeps
-    FIFO ordering strict. But if the Assign Agent call itself fails (a real
-    API error, not just "nobody free"), retrying the same request forever
-    would both spam identical errors and permanently block every customer
-    queued behind it - a single bad room_id must not stall the whole
-    queue - so that entry is marked `failed` and we move on to the next one
-    instead of stopping.
-    """
-    while True:
-        entry = session.exec(
-            select(QueueEntry)
-            .where(QueueEntry.status == QueueStatus.waiting)
-            .order_by(QueueEntry.created_at.asc())
-        ).first()
-        if not entry:
-            break
+    FIFO ordering strict. If the Assign Agent call itself fails, it's
+    retried on a later call to this function (next scheduler poll, or the
+    next webhook that happens to trigger a drain) up to
+    MAX_ASSIGN_ATTEMPTS times - see that constant's comment for why a
+    fresh room can still fail here. A failing entry is skipped for the
+    *rest of this pass* (added to `skip_ids`) rather than retried in a
+    tight loop, so other customers queued behind it still get served now;
+    it keeps its `waiting` status so the next external call to this
+    function tries it again from scratch. Only once attempts are
+    exhausted is it marked `failed` and skipped for good - a single
+    permanently-bad room_id must not stall the whole queue forever.
 
+    The whole "pick oldest waiting entry, then decide" step runs inside
+    _allocation_lock, not just the decide-and-assign part - otherwise two
+    concurrent callers (e.g. a resolved-webhook drain overlapping a
+    scheduler poll) can both pick the same entry before either commits,
+    and both attempt (and log) the same assign/retry. Confirmed in
+    production (2026-08-20): the same queue entry's "giving up" line
+    logged twice, 240ms apart, for what should have been a single failed
+    attempt.
+    """
+    skip_ids: set[int] = set()
+    while True:
         with _allocation_lock:
+            query = select(QueueEntry).where(QueueEntry.status == QueueStatus.waiting)
+            if skip_ids:
+                query = query.where(QueueEntry.id.not_in(skip_ids))
+            entry = session.exec(query.order_by(QueueEntry.created_at.asc())).first()
+            if not entry:
+                break
+
             # Same duplicate-webhook scenario as handle_new_session can
             # land a room in the queue that's already been served by
             # another (non-duplicate) delivery - discard rather than
@@ -230,12 +254,21 @@ def process_queue(session: Session) -> None:
 
             assigned = assign_customer_to_agent(session, candidate["id"], entry.room_id, entry.customer_id)
             if not assigned:
-                logger.warning(
-                    "Giving up on queue entry id=%s room=%s after a failed assign call - "
-                    "marking failed instead of retrying forever",
-                    entry.id, entry.room_id,
-                )
-                entry.status = QueueStatus.failed
+                entry.attempts += 1
+                if entry.attempts >= MAX_ASSIGN_ATTEMPTS:
+                    logger.warning(
+                        "Giving up on queue entry id=%s room=%s after %d failed assign attempts - "
+                        "marking failed instead of retrying forever",
+                        entry.id, entry.room_id, entry.attempts,
+                    )
+                    entry.status = QueueStatus.failed
+                else:
+                    logger.warning(
+                        "Assign attempt %d/%d failed for queue entry id=%s room=%s - will retry on a "
+                        "later poll",
+                        entry.attempts, MAX_ASSIGN_ATTEMPTS, entry.id, entry.room_id,
+                    )
+                    skip_ids.add(entry.id)
                 session.add(entry)
                 session.commit()
                 continue
